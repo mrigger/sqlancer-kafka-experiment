@@ -12,11 +12,18 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.JCommander.Builder;
@@ -154,7 +161,7 @@ public final class Main {
             if (!logEachSelect) {
                 throw new UnsupportedOperationException();
             }
-            printState(getCurrentFileWriter(), state);
+            printState(getCurrentFileWriter(), state, null);
             try {
                 currentFileWriter.flush();
 
@@ -184,12 +191,12 @@ public final class Main {
             }
         }
 
-        public void logException(Throwable reduce, StateToReproduce state) {
+        public void logException(Throwable reduce, StateToReproduce state, Producer<String, String> producer) {
             Loggable stackTrace = getStackTrace(reduce);
             FileWriter logFileWriter2 = getLogFileWriter();
             try {
                 logFileWriter2.write(stackTrace.getLogString());
-                printState(logFileWriter2, state);
+                printState(logFileWriter2, state, producer);
             } catch (IOException e) {
                 throw new AssertionError(e);
             } finally {
@@ -206,7 +213,7 @@ public final class Main {
             return databaseProvider.getLoggableFactory().convertStacktraceToLoggable(e1);
         }
 
-        private void printState(FileWriter writer, StateToReproduce state) {
+        private void printState(FileWriter writer, StateToReproduce state, Producer<String, String> producer) {
             StringBuilder sb = new StringBuilder();
 
             sb.append(databaseProvider.getLoggableFactory()
@@ -218,6 +225,20 @@ public final class Main {
             }
             try {
                 writer.write(sb.toString());
+                if (producer != null) {
+                    JSONObject obj = new JSONObject();
+                    JSONObject testCase = new JSONObject().put("type", "string").put("field", "testcase")
+                            .put("optional", "false");
+                    JSONObject version = new JSONObject().put("type", "string").put("field", "version").put("optional",
+                            "false");
+                    obj.put("schema", new JSONObject().put("type", "struct").put("fields",
+                            new JSONArray().put(testCase).put(version)));
+                    JSONObject payload = new JSONObject();
+                    payload.put("testcase", sb.toString());
+                    payload.put("version", state.getDatabaseVersion());
+                    obj.put("payload", payload);
+                    producer.send(new ProducerRecord<String, String>("bugs", state.getDatabaseName(), obj.toString()));
+                }
             } catch (IOException e) {
                 throw new AssertionError(e);
             }
@@ -473,6 +494,21 @@ public final class Main {
             }
             execService.execute(new Runnable() {
 
+                Producer<String, String> producer;
+
+                {
+                    Properties props = new Properties();
+                    props.put("bootstrap.servers", "localhost:9092");
+                    props.put("acks", "all");
+                    props.put("retries", 0);
+                    props.put("linger.ms", 1);
+                    props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+                    props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+                    producer = new KafkaProducer<>(props);
+
+                }
+
                 @Override
                 public void run() {
                     Thread.currentThread().setName(databaseName);
@@ -497,6 +533,7 @@ public final class Main {
                             }
                         }
                     } finally {
+                        producer.close();
                         threadsShutdown++;
                         if (threadsShutdown == options.getTotalNumberTries()) {
                             execService.shutdown();
@@ -516,7 +553,7 @@ public final class Main {
                         reduce.printStackTrace();
                         executor.getStateToReproduce().exception = reduce.getMessage();
                         executor.getLogger().logFileWriter = null;
-                        executor.getLogger().logException(reduce, executor.getStateToReproduce());
+                        executor.getLogger().logException(reduce, executor.getStateToReproduce(), producer);
                         return false;
                     } finally {
                         try {
